@@ -51,6 +51,9 @@ struct Args {
     /// maximum number of carbons in the molecule
     #[arg(long, default_value_t = 70)]
     max_carbons: i32,
+    /// allow matching fragments with zero carbon labeling (no isotope shift)
+    #[arg(long, default_value_t = false)]
+    allow_zero_carbon_matching: bool,
     /// output MGF file suffix
     #[arg(long, default_value_t = String::from("_matchedCleaned"))]
     output_suffix: String,
@@ -227,9 +230,18 @@ fn normalize_spectra_intensity(blocks: &mut Vec<Block>) {
     }
 }
 
-fn cosine_similarity(spec: &Block, spec_other: &Block, isotope_mz_diff: f64, min_carbons: i32, max_carbons: i32, fragment_mz_tolerance: f64, direction: i32) -> (f64, Vec<i32>, Vec<i32>) {
+fn cosine_similarity(
+    spec: &Block,
+    spec_other: &Block,
+    isotope_mz_diff: f64,
+    min_carbons: i32,
+    max_carbons: i32,
+    fragment_mz_tolerance: f64,
+    direction: i32,
+    allow_zero_carbon: bool,
+) -> (f64, Vec<i32>, Vec<i32>) {
     if spec.spectrum.mz.len() > spec_other.spectrum.mz.len() {
-        let (score, assignments_a, assignments_b) = cosine_similarity(spec_other, spec, isotope_mz_diff, min_carbons, max_carbons, fragment_mz_tolerance, direction * -1);
+        let (score, assignments_a, assignments_b) = cosine_similarity(spec_other, spec, isotope_mz_diff, min_carbons, max_carbons, fragment_mz_tolerance, direction * -1, allow_zero_carbon);
         return (score, assignments_b, assignments_a);
     }
 
@@ -241,7 +253,18 @@ fn cosine_similarity(spec: &Block, spec_other: &Block, isotope_mz_diff: f64, min
     let mut cost_matrix_intensity = vec![vec![0; spec_other.spectrum.mz.len() * 2]; spec.spectrum.mz.len()];
     for (peak_index, (&peak_mz, &peak_intensity)) in spec.spectrum.mz.iter().zip(&spec.spectrum.intensity).enumerate() {
         for (peak_other_index, (&peak_other_mz, &peak_other_intensity)) in spec_other.spectrum.mz.iter().zip(&spec_other.spectrum.intensity).enumerate() {
-            for xn in min_carbons..max_carbons + 1 {
+            // Determine carbon values based on zero carbon matching option
+            let carbon_values: Vec<i32> = if allow_zero_carbon {
+                // Use 0 first, then min_carbons to max_carbons (skipping 1 to min_carbons-1)
+                let mut values = vec![0];
+                values.extend(min_carbons..max_carbons + 1);
+                values
+            } else {
+                // Use normal range from min_carbons to max_carbons
+                (min_carbons..max_carbons + 1).collect()
+            };
+
+            for &xn in &carbon_values {
                 let peak_adjusted_mz = peak_mz + (isotope_mz_diff * (direction as f64)) * xn as f64;
                 if (peak_adjusted_mz - peak_other_mz).abs() <= fragment_mz_tolerance {
                     cost_matrix_intensity[peak_index][peak_other_index] = (1. + peak_intensity * peak_other_intensity * 1_000_000.0) as i64;
@@ -301,8 +324,16 @@ fn cosine_similarity(spec: &Block, spec_other: &Block, isotope_mz_diff: f64, min
     return (score as f64 / 1_000_000.0, adjusted_assignments_a, adjusted_assignments_b);
 }
 
-fn isotopolog_match_optimization(block_a: &Block, block_b: &Block, isotope_mz_diff: f64, max_mz_dev_ppm: f64, min_carbons: i32, max_carbons: i32) -> (f64, Vec<i32>, Vec<i32>) {
-    let (c_score, c_assignment_a, c_assignment_b) = cosine_similarity(block_a, block_b, isotope_mz_diff, min_carbons, max_carbons, 0.005, 1);
+fn isotopolog_match_optimization(
+    block_a: &Block,
+    block_b: &Block,
+    isotope_mz_diff: f64,
+    max_mz_dev_ppm: f64,
+    min_carbons: i32,
+    max_carbons: i32,
+    allow_zero_carbon: bool,
+) -> (f64, Vec<i32>, Vec<i32>) {
+    let (c_score, c_assignment_a, c_assignment_b) = cosine_similarity(block_a, block_b, isotope_mz_diff, min_carbons, max_carbons, 0.005, 1, allow_zero_carbon);
 
     return (c_score, c_assignment_a, c_assignment_b);
 }
@@ -585,7 +616,16 @@ fn plot_blocks_to_pdf(block_a: &Block, block_b: &Block, assignment_a: Vec<i32>, 
     Ok(())
 }
 
-fn find_block_pairs(blocks: &Vec<Block>, isotope_mz_diff: f64, max_rt_diff: f64, precursor_mz_dev: f64, min_carbons: i32, max_carbons: i32, output_folder: &str) -> Vec<(Block, Block, Block)> {
+fn find_block_pairs(
+    blocks: &Vec<Block>,
+    isotope_mz_diff: f64,
+    max_rt_diff: f64,
+    precursor_mz_dev: f64,
+    min_carbons: i32,
+    max_carbons: i32,
+    output_folder: &str,
+    allow_zero_carbon: bool,
+) -> Vec<(Block, Block, Block)> {
     let results = Mutex::new(Vec::new());
     let mut matching_blocks = 1;
 
@@ -631,7 +671,7 @@ fn find_block_pairs(blocks: &Vec<Block>, isotope_mz_diff: f64, max_rt_diff: f64,
                 );
 
                 let start = Instant::now();
-                let result = std::panic::catch_unwind(|| isotopolog_match_optimization(block1, block2, isotope_mz_diff, precursor_mz_dev, min_carbons, est_xn));
+                let result = std::panic::catch_unwind(|| isotopolog_match_optimization(block1, block2, isotope_mz_diff, precursor_mz_dev, min_carbons, est_xn, allow_zero_carbon));
 
                 match result {
                     Ok(res) => {
@@ -705,6 +745,7 @@ fn main() {
     println!("Maximum precursor m/z deviation (ppm): {}", args.precursor_mz_dev);
     println!("Minimum number of carbons: {}", args.min_carbons);
     println!("Maximum number of carbons: {}", args.max_carbons);
+    println!("Allow zero carbon matching: {}", args.allow_zero_carbon_matching);
     println!("Output MGF file suffix: {}", args.output_suffix);
     println!("");
 
@@ -738,6 +779,7 @@ fn main() {
         args.min_carbons,
         args.max_carbons,
         &args.output_folder,
+        args.allow_zero_carbon_matching,
     );
     println!("Found {} putative matching block pairs.", pairs.len());
     println!("");
