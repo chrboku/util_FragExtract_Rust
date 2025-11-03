@@ -10,7 +10,6 @@ use std::fs::File;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -28,6 +27,36 @@ struct Block {
     collision_energy: String,
     other_lines: Vec<String>,
     spectrum: SpectrumData,
+}
+
+#[derive(Clone)]
+struct MatchCandidate {
+    partner: Block,
+    cleaned_native: Block,
+    score: f64,
+    assignment_a: Vec<i32>,
+    assignment_b: Vec<i32>,
+    grouping_summary: Option<String>,
+}
+
+fn apply_processing_info(other_lines: &mut Vec<String>, info: &str) {
+    if let Some(pos) = other_lines.iter().position(|line| line.starts_with("PROCESSING_INFO=")) {
+        other_lines[pos] = format!("PROCESSING_INFO={}", info);
+    } else {
+        other_lines.push(format!("PROCESSING_INFO={}", info));
+    }
+}
+
+fn sanitize_for_filename(input: &str) -> String {
+    let mut sanitized = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    sanitized.trim_matches('_').to_string()
 }
 
 #[derive(Parser, Debug)]
@@ -63,6 +92,32 @@ struct Args {
     /// Output folder for plots
     #[arg(long, default_value_t = String::from("./output_plots"))]
     output_folder: String,
+    /// Comma-separated metadata keys used to group spectra before matching
+    #[arg(long, default_value_t = String::new())]
+    grouping_fields: String,
+}
+
+fn build_run_descriptor(args: &Args) -> String {
+    let grouping_display = if args.grouping_fields.trim().is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[{}]", args.grouping_fields.trim())
+    };
+
+    format!(
+        "FRAGEXTRACT v{} | input={} | suffix={} | isotope_diff={:.6} | max_rt_diff={:.3} | precursor_ppm={:.2} | carbon_range={}-{} | zero_carbon={} | min_rel_intensity={:.3} | grouping_fields={}",
+        env!("CARGO_PKG_VERSION"),
+        args.input_mgf,
+        args.output_suffix,
+        args.isotope_mz_diff,
+        args.max_rt_diff,
+        args.precursor_mz_dev,
+        args.min_carbons,
+        args.max_carbons,
+        args.allow_zero_carbon_matching,
+        args.min_relative_fragment_intensity,
+        grouping_display
+    )
 }
 
 impl Block {
@@ -87,6 +142,55 @@ impl Block {
             println!("  No spectrum data available.");
         }
     }
+
+    fn metadata_value(&self, key: &str) -> Option<String> {
+        let key_upper = key.to_ascii_uppercase();
+        match key_upper.as_str() {
+            "FEATURE_ID" => {
+                if self.feature_id.is_empty() {
+                    None
+                } else {
+                    Some(self.feature_id.clone())
+                }
+            }
+            "PEPMASS" => Some(format!("{:.6}", self.pepmass)),
+            "RTINSECONDS" => Some(format!("{:.6}", self.rtinseconds)),
+            "COLLISION_ENERGY" => {
+                if self.collision_energy.is_empty() {
+                    None
+                } else {
+                    Some(self.collision_energy.clone())
+                }
+            }
+            "PRECURSOR_CHARGE" => Some(self.precursor_charge.to_string()),
+            _ => {
+                for line in &self.other_lines {
+                    if let Some((k, v)) = line.split_once('=') {
+                        if k.eq_ignore_ascii_case(&key_upper) {
+                            return Some(v.to_string());
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+fn grouping_summary_if_match(block_a: &Block, block_b: &Block, fields: &[String]) -> Option<String> {
+    if fields.is_empty() {
+        return Some(String::new());
+    }
+
+    let mut summary_parts = Vec::with_capacity(fields.len());
+    for field in fields {
+        match (block_a.metadata_value(field), block_b.metadata_value(field)) {
+            (Some(a), Some(b)) if a == b => summary_parts.push(format!("{}={}", field, a)),
+            _ => return None,
+        }
+    }
+
+    Some(summary_parts.join(", "))
 }
 
 fn parse_mgf<P: AsRef<Path>>(path: P) -> Vec<Block> {
@@ -507,7 +611,7 @@ fn plot_blocks_to_pdf(block_a: &Block, block_b: &Block, assignment_a: Vec<i32>, 
     let bottom = plot_areas.get(2).unwrap();
 
     let mut chart = ChartBuilder::on(top)
-        .caption(title, ("sans-serif", 25))
+        .caption(title, ("sans-serif", 20))
         .margin(20)
         .x_label_area_size(40)
         .y_label_area_size(60)
@@ -540,7 +644,7 @@ fn plot_blocks_to_pdf(block_a: &Block, block_b: &Block, assignment_a: Vec<i32>, 
     }
 
     let mut chart = ChartBuilder::on(middle)
-        .caption("Raw spectra with matching peaks highlighted", ("sans-serif", 25))
+        .caption("Raw spectra with matching peaks highlighted", ("sans-serif", 20))
         .margin(20)
         .x_label_area_size(40)
         .y_label_area_size(60)
@@ -581,7 +685,7 @@ fn plot_blocks_to_pdf(block_a: &Block, block_b: &Block, assignment_a: Vec<i32>, 
     }
 
     let mut chart = ChartBuilder::on(bottom)
-        .caption("Cleaned, native spectrum", ("sans-serif", 25))
+        .caption("Cleaned, native spectrum", ("sans-serif", 20))
         .margin(20)
         .x_label_area_size(40)
         .y_label_area_size(60)
@@ -625,8 +729,10 @@ fn find_block_pairs(
     max_carbons: i32,
     output_folder: &str,
     allow_zero_carbon: bool,
+    run_descriptor: &str,
+    grouping_fields: &[String],
 ) -> Vec<(Block, Block, Block)> {
-    let results = Mutex::new(Vec::new());
+    let mut results = Vec::new();
     let mut matching_blocks = 1;
 
     let output_folder = output_folder.to_string();
@@ -638,13 +744,33 @@ fn find_block_pairs(
     }
 
     for (i, block1) in blocks.iter().enumerate() {
-        let curResults = Mutex::new(Vec::new());
+        let mut candidates: Vec<MatchCandidate> = Vec::new();
         let pepmass1 = block1.pepmass;
         let rt1 = block1.rtinseconds / 60.0;
 
         println!("Processing block {}: feature_id={}, precursor mz={}, rt={} min ", i + 1, block1.feature_id, pepmass1, rt1);
 
+        if !grouping_fields.is_empty() {
+            let grouping_snapshot = grouping_fields
+                .iter()
+                .map(|field| {
+                    let value = block1.metadata_value(field).unwrap_or_else(|| String::from("<missing>"));
+                    format!("{}={}", field, value)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("      - Grouping fields (block context): {}", grouping_snapshot);
+        }
+
         for (j, block2) in blocks.iter().enumerate() {
+            let grouping_summary = if grouping_fields.is_empty() {
+                None
+            } else {
+                match grouping_summary_if_match(block1, block2, grouping_fields) {
+                    Some(summary) => Some(summary),
+                    None => continue,
+                }
+            };
             let pepmass2 = block2.pepmass;
             let rt2 = block2.rtinseconds / 60.0;
             if i == j || (rt1 - rt2).abs() > max_rt_diff || pepmass1 > pepmass2 || pepmass1 + min_carbons as f64 > pepmass2 {
@@ -681,6 +807,17 @@ fn find_block_pairs(
 
                         let used_fragments_n = assignment_a.iter().filter(|&&a| a >= 0).count();
 
+                        if used_fragments_n == 0 {
+                            println!("{}", "      - No matched fragment pairs found after optimization; skipping.".yellow());
+                            continue;
+                        }
+
+                        if let Some(summary) = grouping_summary.as_ref() {
+                            if !summary.is_empty() {
+                                println!("      - Grouping fields: {}", summary);
+                            }
+                        }
+
                         println!("      - Cosine similarity score (took {:.2} sec): {:.2}", start.elapsed().as_secs_f64(), score);
                         println!(
                             "      - using {} fragments of the {} fragments of spectrum A and {} fragments of spectrum B",
@@ -688,19 +825,6 @@ fn find_block_pairs(
                             block1.spectrum.mz.len(),
                             block2.spectrum.mz.len()
                         );
-
-                        plot_blocks_to_pdf(
-                            block1,
-                            block2,
-                            assignment_a.clone(),
-                            assignment_b.clone(),
-                            &format!("{}/output_{}_{}.svg", output_folder, block1.feature_id, block2.feature_id),
-                            isotope_mz_diff,
-                        )
-                        .unwrap_or_else(|e| {
-                            println!("{}", format!("      - Error plotting blocks to PDF: {}", e).red());
-                        });
-                        println!("      - Exported plot to {}/output_{}_{}.svg", output_folder, block1.feature_id, block2.feature_id);
 
                         let mut cleaned_block1 = block1.clone();
                         let mut new_mz = Vec::new();
@@ -714,7 +838,36 @@ fn find_block_pairs(
                         cleaned_block1.spectrum.mz = new_mz;
                         cleaned_block1.spectrum.intensity = new_intensity;
 
-                        curResults.lock().unwrap().push((block1.clone(), block2.clone(), cleaned_block1.clone()));
+                        if cleaned_block1.spectrum.mz.is_empty() {
+                            println!("{}", "      - Cleaned spectrum contains no fragments; skipping.".yellow());
+                            continue;
+                        }
+
+                        let mut processing_entry = format!(
+                            "{} | native_feature={} | partner_feature={} | matched_fragments={} | score={:.4}",
+                            run_descriptor,
+                            if block1.feature_id.is_empty() { "<unknown>" } else { &block1.feature_id },
+                            if block2.feature_id.is_empty() { "<unknown>" } else { &block2.feature_id },
+                            cleaned_block1.spectrum.mz.len(),
+                            score
+                        );
+
+                        if let Some(summary) = grouping_summary.as_ref() {
+                            if !summary.is_empty() {
+                                processing_entry.push_str(&format!(" | grouping={}", summary));
+                            }
+                        }
+
+                        apply_processing_info(&mut cleaned_block1.other_lines, &processing_entry);
+
+                        candidates.push(MatchCandidate {
+                            partner: block2.clone(),
+                            cleaned_native: cleaned_block1,
+                            score,
+                            assignment_a,
+                            assignment_b,
+                            grouping_summary: grouping_summary.clone(),
+                        });
                     }
                     Err(_) => {
                         println!("   - Error occurred during isotopolog_match_optimization, skipping...");
@@ -722,16 +875,55 @@ fn find_block_pairs(
                 }
             }
         }
-        if curResults.lock().unwrap().len() == 0 {
+        if candidates.is_empty() {
             println!("{}", format!("   - Warning: No matching other spectra found.").yellow());
-        } else if curResults.lock().unwrap().len() > 1 {
-            println!("{}", format!("   - Error: Found more than 1 matching spectra, skipping for now.").red());
         } else {
-            results.lock().unwrap().extend(curResults.into_inner().unwrap());
+            let total_matches = candidates.len();
+            let mut candidates = candidates;
+            candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            let mut best_candidate_iter = candidates.into_iter();
+            if let Some(best_candidate) = best_candidate_iter.next() {
+                if total_matches > 1 {
+                    println!(
+                        "{}",
+                        format!(
+                            "   - Note: Found {} matching spectra; keeping best with score {:.2} (feature {}).",
+                            total_matches, best_candidate.score, best_candidate.partner.feature_id
+                        )
+                        .yellow()
+                    );
+                }
+
+                let grouping_suffix = best_candidate
+                    .grouping_summary
+                    .as_ref()
+                    .filter(|summary| !summary.is_empty())
+                    .map(|summary| {
+                        let sanitized = sanitize_for_filename(summary);
+                        if sanitized.is_empty() { String::new() } else { format!("_{}", sanitized) }
+                    })
+                    .unwrap_or_default();
+
+                let plot_path = format!("{}/output_{}_{}{}.svg", output_folder, block1.feature_id, best_candidate.partner.feature_id, grouping_suffix);
+                if let Err(e) = plot_blocks_to_pdf(
+                    block1,
+                    &best_candidate.partner,
+                    best_candidate.assignment_a.clone(),
+                    best_candidate.assignment_b.clone(),
+                    &plot_path,
+                    isotope_mz_diff,
+                ) {
+                    println!("{}", format!("      - Error plotting blocks to PDF: {}", e).red());
+                } else {
+                    println!("      - Exported plot to {}", plot_path);
+                }
+
+                results.push((block1.clone(), best_candidate.partner, best_candidate.cleaned_native));
+            }
         }
         println!("");
     }
-    results.into_inner().unwrap()
+    results
 }
 
 fn main() {
@@ -771,6 +963,19 @@ fn main() {
 
     println!("---------------------------------------------------------------------");
     println!("Finding putative matching block pairs...");
+    let run_descriptor = build_run_descriptor(&args);
+    let grouping_fields: Vec<String> = args
+        .grouping_fields
+        .split(',')
+        .filter_map(|field| {
+            let trimmed = field.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_ascii_uppercase()) }
+        })
+        .collect();
+
+    if !grouping_fields.is_empty() {
+        println!("Grouping fields enforced: {}", grouping_fields.join(", "));
+    }
     let pairs = find_block_pairs(
         &mut blocks,
         args.isotope_mz_diff,
@@ -780,13 +985,15 @@ fn main() {
         args.max_carbons,
         &args.output_folder,
         args.allow_zero_carbon_matching,
+        &run_descriptor,
+        &grouping_fields,
     );
     println!("Found {} putative matching block pairs.", pairs.len());
     println!("");
 
     println!("---------------------------------------------------------------------");
     println!("Exporting matching block pairs to MGF format...");
-    //TODO only use the beset match
+    // Each block now contributes only the best-scoring cleaned match
     let output_path = {
         let mut path = args.input_mgf.clone();
         if let Some(pos) = path.rfind(".mgf") {
